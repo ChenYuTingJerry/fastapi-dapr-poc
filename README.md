@@ -1,91 +1,138 @@
-# FastAPI-Dapr POC
-## Project Overview
-This project is a Proof of Concept (POC) demonstrating the integration of FastAPI with Dapr for building microservices. It includes services such as `order-service`, `payment-service`, `workflow-service`, `subscriber-service`, and `delivery-service`, leveraging Dapr's Pub/Sub, State Management, and Workflow features for service communication and orchestration. The project supports both local development and Kubernetes deployment using k3d.
+# fastapi-dapr-poc
 
-## Features
-- **Microservices Architecture**: Multiple independent services built with FastAPI.
-- **Dapr Integration**: Utilizes Dapr's Pub/Sub for messaging, State Management for persistence, and Workflow for orchestration.
-- **Local Development**: Run services locally with Dapr CLI and Docker Compose.
-- **Kubernetes Deployment**: Deploy to a k3d cluster with automated image builds and imports.
-- **API Testing**: Supports testing via HTTP endpoints, with Swagger UI for API documentation.
+> **Status: frozen proof of concept.** Built to evaluate Dapr + FastAPI for team adoption. Not production-ready and no longer actively developed.
 
-## Project Structure
-- `components/`: Dapr component YAML files (pubsub.yaml, statestore.yaml) for Pub/Sub and State Management.
-- `k8s/`: Kubernetes deployment YAML files for services and resources.
-- `apps/`: Source code for microservices (e.g., order_service, payment_service).
-    - `main.py`: Entry point for each service.
-- `Dockerfile`: Dockerfiles for building service images, with one in the root for `order-service` and others in `apps/<service>/`.
-- `docker-compose.yml`: Configuration for local development with Docker Compose.
-- `Makefile`: Automates build, deployment, and testing tasks.
+## Why this exists
 
-## Prerequisites
-To run this project, ensure the following tools are installed:
-- Python >= 3.11
-- Poetry for dependency management (`pip install poetry`)
-- Dapr CLI for Dapr runtime
-- Docker and Docker Compose
-- k3d for lightweight Kubernetes deployment
-- kubectl for Kubernetes management
-- Helm for deploying Redis in k3d
+I wanted to find out whether [Dapr](https://dapr.io) is a credible foundation for a team that already writes microservices in FastAPI. Specifically: do Dapr's building blocks (service invocation, pub/sub, workflow) actually let me write services that don't know about each other's hosts, ports, or transport, *and* do they hold up when the same code moves from a laptop to Kubernetes? This repo is the smallest end-to-end thing I could build that exercises all three building blocks at once.
 
-## Installation
-1. **Clone the Repository:**
-    ```bash
-    git clone https://github.com/ChenYuTingJerry/fastapi-dapr.git
-    cd fastapi-dapr
-    ```
-2. **Install Python Dependencies:** Use Poetry to install dependencies:
-    ```bash
-    make install
-    ```
-3. Initialize Dapr: Set up the Dapr runtime, which automatically starts a Redis container:
-    ```bash
-    make init-dapr
-    ```
-   
-## Running Locally
-1. Start All Services: Launch services with Dapr sidecars using the configuration in `dapr.yaml`:
-    ```bash
-    make run-all
-    ```
-   Note: `dapr init` handles Redis setup, so no manual Redis container is needed.
-2. Test the API: Run the test command to verify endpoints:
-    ```bash
-    make test
-    ```
-   
-## Running on Kubernetes with k3d
-1. **Deploy to k3d:** Deploy all components and services to a k3d cluster with a single command:
-    ```bash
-    make run-k3d
-    ```
-This command:
-- Creates or starts a k3d cluster named `dapr-cluster` with `--port 8081:80@loadbalancer`, mapping LoadBalancer services' port 80 to `localhost:8081`.
-- Installs Dapr on k3d.
-- Deploys Redis via Helm.
-- Applies Dapr components (`pubsub.yaml`, `statestore.yaml`) with k3d-specific Redis configuration.
-- Builds Docker images using `docker-compose build` and imports them to k3d with `k3d image import`.
-- Deploys services from `k8s/` to the cluster.
-6. **Test the API:** Run tests on the k3d cluster:
-    ```bash
-    make test-k3d
-    ```
-## Troubleshooting
-- **ErrImageNeverPull**: Ensure images are imported into k3d:
-    ```bash
-    k3d image import fastapi-dapr/order-service:latest -c dapr-cluster
-    ```
-  Verify images in k3d node:
-    ```bash
-    docker exec k3d-dapr-cluster-server-0 docker images | grep fastapi-dapr
-    ```
+## What it shows
 
-## Contact
-- For questions or support, create a GitHub issue or contact the maintainer at nmjk2000@gmail.com.
+Four FastAPI services collaborating on a fake "place an order" flow. Every cross-service hop goes through a Dapr sidecar — there is no direct HTTP between services in the application code.
 
+```
+   POST /create
+        │
+        ▼
+  ┌──────────────┐  invoke_method   ┌────────────────┐
+  │ order-service│ ───────────────▶ │ payment-service│
+  └──────────────┘                  └───────┬────────┘
+                                            │ publish_event
+                                            ▼
+                                  ┌───────────────────┐
+                                  │  pub/sub: pubsub  │
+                                  │ topic: payment.   │
+                                  │       success     │
+                                  └─────────┬─────────┘
+                                            │ subscribe
+                                            ▼
+                                  ┌───────────────────┐
+                                  │ subscriber-service│
+                                  └─────────┬─────────┘
+                                            │ invoke_method
+                                            ▼
+                                  ┌───────────────────┐
+                                  │  workflow-service │
+                                  │  schedules wf:    │
+                                  │  deliver_product  │
+                                  │   → notify_user   │
+                                  └───────────────────┘
+```
 
-## Acknowledgments
-- FastAPI for the web framework.
-- Dapr for microservices runtime.
-- k3d for lightweight Kubernetes.
-- Poetry for dependency management.
+## The thing I'm proud of
+
+The same service code runs unchanged locally (`dapr run -f dapr.yaml`) and on a k3d cluster. Dapr abstracts the Redis host, the pub/sub topic plumbing, and service discovery — none of that leaks into the Python.
+
+There is exactly one env-specific seam in the whole repo, and it lives in the makefile, not in the application code:
+
+```make
+# components/pubsub.yaml + components/statestore.yaml point at localhost:6379
+# for local dev. For k3d we rewrite that to the in-cluster Redis service.
+sed 's/value: "localhost:6379"/value: "redis-master.default.svc.cluster.local:6379"/' \
+    components/pubsub.yaml > components/pubsub-k8s.yaml
+```
+
+That's it. Nothing else changes between environments.
+
+## Quickstart — local
+
+Prereqs: Python ≥ 3.11, [Poetry](https://python-poetry.org), [Dapr CLI](https://docs.dapr.io/getting-started/install-dapr-cli/), Docker, [HTTPie](https://httpie.io) (for the smoke test).
+
+```bash
+make install      # poetry install
+make run-all      # dapr init + dapr run -f dapr.yaml (all 4 services + sidecars)
+make test         # http POST http://0.0.0.0:8001/create
+```
+
+You should see the order service log a `/create`, the payment service log a `/pay` and publish a `payment.success` event, the subscriber service log `📨 收到 PubSub 訊息`, and finally the workflow service log `🧭 Workflow started ...` followed by `📦 Delivering product ...` and `📬 Notifying user ...`.
+
+Tear down with `make stop`.
+
+## Quickstart — k3d
+
+Extra prereqs: [k3d](https://k3d.io), `kubectl`, [Helm](https://helm.sh).
+
+```bash
+make run-k3d      # one command, ~a few minutes the first time
+make test-k3d     # http POST http://localhost:8081/create
+```
+
+`make run-k3d` does the following in order:
+
+1. Creates (or starts) a k3d cluster named `dapr-cluster` with `--port 8081:80@loadbalancer`.
+2. Installs Dapr into the cluster (`dapr init -k`).
+3. Installs Redis via the bitnami Helm chart into `default`.
+4. Rewrites the component YAML to point at in-cluster Redis and applies it.
+5. Builds images with `docker compose build` and pushes them into the cluster with `k3d image import` (deployments use `imagePullPolicy: Never`, so the import step is required — if you see `ErrImageNeverPull`, that step didn't run).
+6. Applies the manifests under `k8s/`.
+
+Clean up with `make k3d-delete-cluster`.
+
+## Architecture notes
+
+| Service              | Local port | Dapr HTTP port | Source                          |
+|----------------------|-----------:|---------------:|---------------------------------|
+| `order-service`      |       8001 |           3500 | `apps/order_service/app`        |
+| `payment-service`    |       8002 |           3501 | `apps/payment_service/app`      |
+| `subscriber-service` |       8003 |           3502 | `apps/subscriber_service/app`   |
+| `workflow-service`   |       8004 |           3503 | `apps/workflow_service/app`     |
+
+A few things worth knowing if you read the code:
+
+- **All inter-service traffic goes through `DaprClient`.** Services address each other by `appID` + method name (`client.invoke_method("payment-service", "pay", ...)`), never by host/port. Pub/sub events are published via `client.publish_event(pubsub_name="pubsub", topic_name="payment.success", ...)` and consumed declaratively with `@dapr_app.subscribe(pubsub="pubsub", topic="payment.success")`.
+- **Dapr components live in `components/`.** Two of them: `pubsub.yaml` (Redis Streams) and `statestore.yaml` (Redis, also used as the workflow backend). The makefile's `deploy-components` target rewrites the Redis host before applying them to k3d.
+- **The workflow itself lives in `apps/workflow_service/app/workflow.py`.** It uses `dapr.ext.workflow.WorkflowRuntime` with two activities (`deliver_product`, `notify_user`) chained via `ctx.call_activity`. The HTTP entry point in `routes.py` schedules an instance via `DaprWorkflowClient.schedule_new_workflow`.
+- **`dapr.yaml` is the canonical local config.** The individual `make run-<service>` targets exist but have drifted from `dapr.yaml` in a few places (ports, `--resources-path`); use `make run-all` for anything end-to-end.
+
+## What's NOT here
+
+This is a PoC. It does not have, and was never meant to have:
+
+- **No tests.** `make test` and `make test-k3d` are HTTP smoke calls, not a test suite.
+- **No auth.** Endpoints are open.
+- **No tracing or metrics wiring.** Dapr ships with OpenTelemetry support; this repo doesn't configure it.
+- **Minimal secrets handling.** The Redis password is referenced via `secretKeyRef` in the component YAML, but there is no real secret management story.
+- **No retry / DLQ tuning** on the pub/sub component.
+- **No CI.** No GitHub Actions, no linting gate, no image publishing.
+- **`delivery-service` is referenced in old makefile/README leftovers but does not exist in `apps/`.** It's vestigial and should be ignored.
+
+If you wanted to take this somewhere real, those are the gaps to close.
+
+## Repo layout
+
+```
+apps/
+  order_service/        # POST /create  → invokes payment-service
+  payment_service/      # POST /pay     → publishes payment.success
+  subscriber_service/   # subscribes payment.success → invokes workflow-service
+  workflow_service/     # schedules order_fulfillment_workflow
+components/             # Dapr pubsub + statestore (Redis)
+k8s/                    # Deployment + Service + Ingress per service
+dapr.yaml               # canonical local multi-app run config
+docker-compose.yaml     # used by `make run-k3d` to build images
+makefile                # all the entry points (run-all, run-k3d, test, ...)
+```
+
+## License / contact
+
+No license file. Author: Jerry Chen — `nmjk2000@gmail.com`. Open a GitHub issue if anything in this README is wrong or unclear.
